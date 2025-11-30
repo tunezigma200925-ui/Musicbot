@@ -1,111 +1,85 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-import yt_dlp
-import asyncio
+import wavelink
 import os
 
 # --- CONFIGURATION ---
-TOKEN = os.getenv("DISCORD_TOKEN")  # We will set this in Zeabur later
+TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Setup Bot with Intents
-intents = discord.Intents.default()
-intents.message_content = True
-intents.voice_states = True # Required for voice
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Setup Bot
+class MusicBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix='!', intents=intents)
 
-# YT-DLP Options (For audio quality)
-YDL_OPTIONS = {
-    'format': 'bestaudio/best',
-    'noplaylist': True,
-    'quiet': True,
-    'default_search': 'auto', # Allows searching by name
-    'source_address': '0.0.0.0',
-}
+    async def setup_hook(self):
+        # This connects to the Lavalink Node when the bot starts
+        nodes = [
+            wavelink.Node(
+                uri="https://lava-v4.ajieblogs.eu.org:443", # Free Public Node
+                password="https://ajieblogs.eu.org",
+            )
+        ]
+        await wavelink.Pool.connect(nodes=nodes, client=self, cache_capacity=100)
+        await self.tree.sync()
+        print("Connected to Lavalink Node!")
 
-# FFmpeg Options (To keep connection stable)
-FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn',
-}
+bot = MusicBot()
 
+# --- EVENTS ---
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}!')
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} command(s)")
-    except Exception as e:
-        print(e)
+
+@bot.event
+async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
+    print(f"Node {payload.node.identifier} is ready!")
 
 # --- COMMANDS ---
 
-@bot.tree.command(name="play", description="Plays music from YouTube (URL or Search Name)")
-@app_commands.describe(query="The URL or name of the song")
-async def play(interaction: discord.Interaction, query: str):
-    # 1. Check if user is in a Voice Channel
+@bot.tree.command(name="play", description="Play music from YouTube/Spotify")
+@app_commands.describe(search="URL or Song Name")
+async def play(interaction: discord.Interaction, search: str):
     if not interaction.user.voice:
-        await interaction.response.send_message("You need to be in a voice channel first!", ephemeral=True)
+        await interaction.response.send_message("You need to be in a voice channel!", ephemeral=True)
         return
 
-    await interaction.response.defer() # Defers response so bot doesn't timeout while searching
-
-    # 2. Connect to Voice Channel
-    channel = interaction.user.voice.channel
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
-
-    if voice_client is None:
-        voice_client = await channel.connect()
-    elif voice_client.channel != channel:
-        await voice_client.move_to(channel)
-
-    # 3. Search and Play
-    try:
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            # If query is a URL, use it. If it's text, search it.
-            info = ydl.extract_info(f"ytsearch:{query}" if "http" not in query else query, download=False)
-            
-            # Handle search results (gets the first item)
-            if 'entries' in info:
-                info = info['entries'][0]
-                
-            url = info['url']
-            title = info['title']
-            
-            # Stop current music if playing
-            if voice_client.is_playing():
-                voice_client.stop()
-
-            # Play the stream
-            source = discord.FFmpegPCMAudio(url, **FFMPEG_OPTIONS)
-            voice_client.play(source)
-            
-            await interaction.followup.send(f"🎵 Now playing: **{title}**")
-            
-    except Exception as e:
-        await interaction.followup.send(f"An error occurred: {e}")
-
-@bot.tree.command(name="stop", description="Stops music and disconnects")
-async def stop(interaction: discord.Interaction):
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
-    if voice_client and voice_client.is_connected():
-        await voice_client.disconnect()
-        await interaction.response.send_message("Disconnected from voice channel.")
+    await interaction.response.defer()
+    
+    # 1. Connect to Voice Channel
+    if not interaction.guild.voice_client:
+        vc: wavelink.Player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
     else:
-        await interaction.response.send_message("I am not in a voice channel.", ephemeral=True)
+        vc: wavelink.Player = interaction.guild.voice_client
 
-# --- ADMIN COMMANDS ---
+    # 2. Search for the song
+    # This automatically handles YouTube, Spotify, and Soundcloud links
+    tracks = await wavelink.Playable.search(search)
+    
+    if not tracks:
+        await interaction.followup.send("No song found.")
+        return
 
-@bot.tree.command(name="music_set", description="Admin only: Setup music channel")
-@app_commands.checks.has_permissions(administrator=True) # Only Admins can use this
-async def music_set(interaction: discord.Interaction, channel: discord.TextChannel):
-    # You can save this channel ID to a database if you want to restrict commands to this channel later
-    await interaction.response.send_message(f"Music commands have been bound to {channel.mention} (Configuration Saved).")
+    track = tracks[0] # Get the first result
 
-@music_set.error
-async def music_set_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+    # 3. Play
+    if vc.playing:
+        await vc.queue.put_wait(track)
+        await interaction.followup.send(f"Added to queue: **{track.title}**")
+    else:
+        await vc.play(track)
+        await interaction.followup.send(f"🎵 Now Playing: **{track.title}**")
 
-# Start Bot
+@bot.tree.command(name="stop", description="Stop music and leave")
+async def stop(interaction: discord.Interaction):
+    vc: wavelink.Player = interaction.guild.voice_client
+    if vc:
+        await vc.disconnect()
+        await interaction.response.send_message("Disconnected.")
+    else:
+        await interaction.response.send_message("I'm not playing anything.", ephemeral=True)
+
+# Run Bot
 bot.run(TOKEN)
